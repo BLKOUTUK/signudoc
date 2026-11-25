@@ -1261,8 +1261,15 @@ export async function deleteEnvelopesAndFiles(
   envelopeIds: readonly string[],
   database: DbExecutor = getDb(),
   storageService: StorageService = createStorageService(),
+  options?: {
+    afterDeleteRows?: (tx: DbExecutor) => Promise<void>;
+  },
 ): Promise<number> {
   if (envelopeIds.length === 0) {
+    if (options?.afterDeleteRows) {
+      await options.afterDeleteRows(database);
+    }
+
     return 0;
   }
 
@@ -1284,16 +1291,30 @@ export async function deleteEnvelopesAndFiles(
     );
   }
 
-  const deleted = await database.query(
-    `DELETE FROM envelopes WHERE id = ANY($1::text[])`,
-    [envelopes.map((envelope) => envelope.id)],
-  );
+  const deleteRows = async (tx: DbExecutor) => {
+    const deleted =
+      envelopes.length > 0
+        ? await tx.query(`DELETE FROM envelopes WHERE id = ANY($1::text[])`, [
+            envelopes.map((envelope) => envelope.id),
+          ])
+        : { rowCount: 0 };
+
+    if (options?.afterDeleteRows) {
+      await options.afterDeleteRows(tx);
+    }
+
+    return deleted.rowCount ?? 0;
+  };
+  const deletedCount =
+    options?.afterDeleteRows && isPool(database)
+      ? await withTransaction(deleteRows, database)
+      : await deleteRows(database);
 
   for (const envelope of envelopes) {
     await deleteThumbnailStoredMeanwhile(envelope, storageService);
   }
 
-  return deleted.rowCount ?? 0;
+  return deletedCount;
 }
 
 export async function runRetentionSweep({

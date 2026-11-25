@@ -86,8 +86,8 @@ export function formatVerifyVerdict(result: VerifyResult): VerifyVerdict {
 
     details.push(
       result.deletedAt !== null
-        ? `Its record and files were deleted from this site on ${formatUtcTimestamp(result.deletedAt)}.`
-        : "Its record and files have since been deleted from this site.",
+        ? `Its envelope record was deleted from this site on ${formatUtcTimestamp(result.deletedAt)}.`
+        : "Its envelope record has since been deleted from this site.",
     );
 
     if (result.envelopeId) {

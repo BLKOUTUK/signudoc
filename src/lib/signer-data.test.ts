@@ -74,6 +74,7 @@ type FakeWebhookDelivery = {
 type FakeDbState = {
   auditEvents: FakeAuditEvent[];
   envelopes: FakeEnvelope[];
+  failNextWebhookDelete?: boolean;
   fields: FakeField[];
   missingWebhookDeliveriesTable?: boolean;
   signers: FakeSigner[];
@@ -130,16 +131,54 @@ function buildWebhookBody({
 }
 
 function createFakePool(state: FakeDbState): pg.Pool {
+  let txSnapshot: Omit<
+    FakeDbState,
+    "failNextWebhookDelete" | "missingWebhookDeliveriesTable"
+  > | null = null;
+
+  const snapshotState = () => ({
+    auditEvents: state.auditEvents.map((event) => ({ ...event })),
+    envelopes: state.envelopes.map((envelope) => ({ ...envelope })),
+    fields: state.fields.map((field) => ({ ...field })),
+    signers: state.signers.map((signer) => ({ ...signer })),
+    webhookDeliveries: state.webhookDeliveries.map((delivery) => ({
+      ...delivery,
+    })),
+  });
+
   const query = async (
     text: string,
     values: unknown[] = [],
   ): Promise<{ rowCount: number; rows: Record<string, unknown>[] }> => {
     const normalized = text.replace(/\s+/g, " ").trim();
 
+    if (normalized === "BEGIN") {
+      txSnapshot = snapshotState();
+      return { rowCount: 0, rows: [] };
+    }
+
+    if (normalized === "COMMIT") {
+      txSnapshot = null;
+      return { rowCount: 0, rows: [] };
+    }
+
+    if (normalized === "ROLLBACK") {
+      if (txSnapshot) {
+        state.auditEvents = txSnapshot.auditEvents;
+        state.envelopes = txSnapshot.envelopes;
+        state.fields = txSnapshot.fields;
+        state.signers = txSnapshot.signers;
+        state.webhookDeliveries = txSnapshot.webhookDeliveries;
+        txSnapshot = null;
+      }
+
+      return { rowCount: 0, rows: [] };
+    }
+
     if (
-      normalized === "BEGIN" ||
-      normalized === "COMMIT" ||
-      normalized === "ROLLBACK"
+      normalized.startsWith("SAVEPOINT ") ||
+      normalized.startsWith("RELEASE SAVEPOINT ") ||
+      normalized.startsWith("ROLLBACK TO SAVEPOINT ")
     ) {
       return { rowCount: 0, rows: [] };
     }
@@ -294,6 +333,11 @@ function createFakePool(state: FakeDbState): pg.Pool {
     }
 
     if (normalized.startsWith("DELETE FROM webhook_deliveries")) {
+      if (state.failNextWebhookDelete) {
+        state.failNextWebhookDelete = false;
+        throw new Error("Simulated webhook deletion interruption");
+      }
+
       const erasedEnvelopeIds = new Set(values[0] as string[]);
       const matchingPayloadIds = new Set(values[1] as string[]);
       const email = String(values[2]).toLowerCase();
@@ -1438,4 +1482,96 @@ test("eraseSignerData deletes webhook deliveries for declined and voided envelop
     (await exportSignerData(signerEmail, db)).webhookDeliveries,
     [],
   );
+});
+
+test("eraseSignerData rolls back envelope deletion if webhook delivery cleanup fails", async () => {
+  const signerEmail = "atomic@example.test";
+  const state: FakeDbState = {
+    auditEvents: [],
+    envelopes: [
+      {
+        createdAt: 400,
+        evidenceKey: null,
+        id: "env-atomic",
+        part11: false,
+        signedPdfKey: null,
+        sourcePdfKey: "missing/atomic.pdf",
+        status: "voided",
+        title: "Atomic check",
+        updatedAt: 401,
+        userId: "u-owner",
+      },
+    ],
+    failNextWebhookDelete: true,
+    fields: [],
+    signers: [
+      {
+        declineReason: null,
+        declinedAt: null,
+        email: signerEmail,
+        envelopeId: "env-atomic",
+        id: "s-atomic",
+        name: "Atomic Signer",
+        role: "signer",
+        signedAt: null,
+        status: "notified",
+      },
+    ],
+    webhookDeliveries: [
+      {
+        createdAt: 402,
+        deliveredAt: 403,
+        endpointId: "we-1",
+        envelopeId: "env-atomic",
+        eventType: "envelope.voided",
+        id: "msg_atomic",
+        payload: buildWebhookBody({
+          envelopeId: "env-atomic",
+          envelopeStatus: "voided",
+          envelopeTitle: "Atomic check",
+          signers: [
+            {
+              email: signerEmail,
+              id: "s-atomic",
+              name: "Atomic Signer",
+              role: "signer",
+              status: "notified",
+            },
+          ],
+          type: "envelope.voided",
+        }),
+        status: "delivered",
+      },
+    ],
+  };
+
+  const db = createFakePool(state);
+
+  await assert.rejects(
+    eraseSignerData(signerEmail, signerEmail, db),
+    /Simulated webhook deletion interruption/,
+  );
+
+  // Envelope row and webhook delivery both remain intact after rollback so the
+  // next attempt erases both cleanly.
+  assert.deepEqual(
+    state.envelopes.map((envelope) => envelope.id),
+    ["env-atomic"],
+  );
+  assert.deepEqual(
+    state.webhookDeliveries.map((delivery) => delivery.id),
+    ["msg_atomic"],
+  );
+
+  const retried = await eraseSignerData(signerEmail, signerEmail, db);
+
+  assert.deepEqual(retried, {
+    deletedEnvelopes: 1,
+    deletedWebhookDeliveries: 1,
+    keptPart11: [],
+    removedFromDrafts: 0,
+    skippedInProgress: [],
+  });
+  assert.equal(state.envelopes.length, 0);
+  assert.equal(state.webhookDeliveries.length, 0);
 });

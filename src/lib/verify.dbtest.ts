@@ -347,3 +347,32 @@ test("envelopes deleted without an envelope_deleted audit event return no match"
     { match: false },
   );
 });
+
+test("partial indexes exist for envelope_deleted SHA-256 fallback lookups", async () => {
+  const { rows } = await database.query<{ indexname: string }>(
+    `
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'public'
+        AND tablename = 'system_audit_events'
+        AND indexname = ANY($1::text[])
+      ORDER BY indexname
+    `,
+    [
+      [
+        "idx_system_audit_events_deleted_evidence_sha256",
+        "idx_system_audit_events_deleted_recipient_evidence_sha256",
+        "idx_system_audit_events_deleted_signed_pdf_sha256",
+      ],
+    ],
+  );
+
+  assert.deepEqual(
+    rows.map((row) => row.indexname),
+    [
+      "idx_system_audit_events_deleted_evidence_sha256",
+      "idx_system_audit_events_deleted_recipient_evidence_sha256",
+      "idx_system_audit_events_deleted_signed_pdf_sha256",
+    ],
+  );
+});

@@ -4639,6 +4639,22 @@ export async function replaceDraftEnvelopeSigners(
     const lockedSignerRoles = new Map(
       lockedSigners.map((signer) => [signer.id, signer.role ?? "signer"]),
     );
+
+    // Reject a stale save whose signer ID existed in the pre-lock snapshot
+    // but was removed concurrently before this transaction acquired the lock;
+    // inserting it anew would drop its saved access_code_hash,
+    // require_email_code, or signature_meaning.
+    for (const signer of nextSigners) {
+      if (
+        !lockedSignerRoles.has(signer.id) &&
+        existingSignerIds.has(signer.id)
+      ) {
+        throw new EnvelopeMutationError(
+          "These signers were changed somewhere else, so this change was not saved. Reload the page to see the latest signers.",
+          409,
+        );
+      }
+    }
     // Any removal of a signer (which cascades to delete their fields) or
     // conversion of a signer into an approver invalidates an open Place fields
     // view, so bump fields_revision under the lock (issue #224).

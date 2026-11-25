@@ -1084,3 +1084,90 @@ test("uncontended field save keeps fields, advances fieldsRevision, and stale re
     },
   );
 });
+
+test("stale signer save referencing a concurrently removed signer returns 409 instead of recreating it without its access code", async () => {
+  const db = createDraftDb();
+  const basePool = db.createPool();
+
+  // First protect Casey with an access code.
+  await replaceDraftEnvelopeSigners(
+    db.userId,
+    db.envelopeId,
+    {
+      signers: [
+        { email: db.rileyEmail, id: db.rileyId, name: "Riley Recipient" },
+        {
+          accessCode: "secret-code-42",
+          email: db.caseyEmail,
+          id: db.caseyId,
+          name: "Casey Second",
+        },
+      ],
+    },
+    basePool,
+  );
+  assert.ok(
+    db.getState().signers.find((signer) => signer.id === db.caseyId)
+      ?.accessCodeHash,
+  );
+
+  // Another tab removes Casey right after this save reads existing signers
+  // (omitting accessCode, as the UI does for unchanged saved codes) and before
+  // it acquires the draft lock.
+  let removedConcurrently = false;
+  const racingPool = db.createPool({
+    onAfterQuery: async (normalized) => {
+      if (
+        !removedConcurrently &&
+        normalized.includes("FROM signers") &&
+        normalized.includes("role = 'cc'")
+      ) {
+        removedConcurrently = true;
+        await replaceDraftEnvelopeSigners(
+          db.userId,
+          db.envelopeId,
+          {
+            signers: [
+              {
+                email: db.rileyEmail,
+                id: db.rileyId,
+                name: "Riley Recipient",
+              },
+            ],
+          },
+          basePool,
+        );
+      }
+    },
+  });
+
+  await assert.rejects(
+    replaceDraftEnvelopeSigners(
+      db.userId,
+      db.envelopeId,
+      {
+        signers: [
+          { email: db.rileyEmail, id: db.rileyId, name: "Riley Renamed" },
+          { email: db.caseyEmail, id: db.caseyId, name: "Casey Second" },
+        ],
+      },
+      racingPool,
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof EnvelopeMutationError);
+      assert.equal(error.statusCode, 409);
+      assert.match(error.message, /Reload the page/);
+      return true;
+    },
+  );
+
+  // Casey stays removed (not recreated with accessCodeHash = null) and Riley's
+  // stale rename was rolled back cleanly.
+  assert.deepEqual(
+    db.getState().signers.map((signer) => ({
+      id: signer.id,
+      name: signer.name,
+    })),
+    [{ id: db.rileyId, name: "Riley Recipient" }],
+  );
+});

@@ -646,3 +646,72 @@ test("a field save overlapping with changing a signer to an approver is refused 
 
   assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
 });
+
+test("a stale signer save referencing a concurrently removed signer returns 409 without recreating it", async () => {
+  const draft = await createDraft();
+
+  await replaceDraftEnvelopeSigners(
+    draft.userId,
+    draft.envelopeId,
+    {
+      signers: [
+        { email: draft.rileyEmail, id: draft.riley, name: "Riley Recipient" },
+        {
+          accessCode: "secret-code-42",
+          email: draft.caseyEmail,
+          id: draft.casey,
+          name: "Casey Second",
+        },
+      ],
+    },
+    database,
+  );
+
+  await assert.rejects(
+    replaceDraftEnvelopeSigners(
+      draft.userId,
+      draft.envelopeId,
+      {
+        signers: [
+          { email: draft.rileyEmail, id: draft.riley, name: "Riley Renamed" },
+          { email: draft.caseyEmail, id: draft.casey, name: "Casey Second" },
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM signers") &&
+          text.includes("role = 'cc'") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, /Reload the page/),
+  );
+
+  const remaining = await database.query<{
+    access_code_hash: string | null;
+    id: string;
+    name: string;
+  }>(
+    `SELECT id, name, access_code_hash FROM signers WHERE envelope_id = $1 ORDER BY sign_order`,
+    [draft.envelopeId],
+  );
+
+  assert.deepEqual(remaining.rows, [
+    { access_code_hash: null, id: draft.riley, name: "Riley Recipient" },
+  ]);
+});

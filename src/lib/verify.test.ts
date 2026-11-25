@@ -364,12 +364,12 @@ test("formatVerifyVerdict confirms origin and notes deletion for deleted envelop
   assert.match(signedVerdict.detail, /The envelope was completed on .+ UTC\./);
   assert.match(
     signedVerdict.detail,
-    /Its record and files were deleted from this site on .+ UTC\./,
+    /Its envelope record was deleted from this site on .+ UTC\./,
   );
   assert.match(signedVerdict.detail, /Envelope ID env-deleted-2\.$/);
   assert.doesNotMatch(
     signedVerdict.detail,
-    /0 signers|kept on this site|did not produce/i,
+    /0 signers|kept on this site|did not produce|files were deleted/i,
   );
 
   const minimalCertVerdict = formatVerifyVerdict({
@@ -390,7 +390,7 @@ test("formatVerifyVerdict confirms origin and notes deletion for deleted envelop
   );
   assert.equal(
     minimalCertVerdict.detail,
-    "Its record and files have since been deleted from this site.",
+    "Its envelope record has since been deleted from this site.",
   );
 });
 

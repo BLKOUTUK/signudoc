@@ -324,7 +324,14 @@ async function deleteSignerWebhookDeliveries(
   email: string,
   erasedEnvelopeIds: readonly string[],
   database: DbExecutor,
+  options?: { inTransaction?: boolean },
 ): Promise<number> {
+  const useSavepoint = options?.inTransaction === true;
+
+  if (useSavepoint) {
+    await database.query("SAVEPOINT signer_webhook_cleanup");
+  }
+
   try {
     const candidates = await queryMany<{ id: string; payload: string }>(
       database,
@@ -351,6 +358,10 @@ async function deleteSignerWebhookDeliveries(
       .map((row) => row.id);
 
     if (erasedEnvelopeIds.length === 0 && matchingPayloadIds.length === 0) {
+      if (useSavepoint) {
+        await database.query("RELEASE SAVEPOINT signer_webhook_cleanup");
+      }
+
       return 0;
     }
 
@@ -380,9 +391,18 @@ async function deleteSignerWebhookDeliveries(
       [erasedEnvelopeIds, matchingPayloadIds, email],
     );
 
+    if (useSavepoint) {
+      await database.query("RELEASE SAVEPOINT signer_webhook_cleanup");
+    }
+
     return deleted.rowCount ?? 0;
   } catch (error) {
     if (isMissingSchemaError(error)) {
+      if (useSavepoint) {
+        await database.query("ROLLBACK TO SAVEPOINT signer_webhook_cleanup");
+        await database.query("RELEASE SAVEPOINT signer_webhook_cleanup");
+      }
+
       return 0;
     }
 
@@ -564,17 +584,37 @@ export async function eraseSignerData(
   const finishedEnvelopeIds = [
     ...new Set(finished.map((row) => row.envelopeId)),
   ];
-  const deletedEnvelopes = await deleteEnvelopesAndFiles(
-    finishedEnvelopeIds,
-    database,
-  );
-  // webhook_deliveries has no foreign key to envelopes, so deleting an
-  // envelope leaves its stored JSON payloads behind unless cleared here.
-  const deletedWebhookDeliveries = await deleteSignerWebhookDeliveries(
-    email,
-    finishedEnvelopeIds,
-    database,
-  );
+  let deletedWebhookDeliveries = 0;
+  // webhook_deliveries has no foreign key to envelopes, so delete both in the
+  // same transaction when removing finished envelopes. An interruption or DB
+  // error therefore rolls back both deletions instead of leaving webhook
+  // payloads orphaned behind already-deleted envelopes.
+  const deletedEnvelopes =
+    finishedEnvelopeIds.length > 0
+      ? await deleteEnvelopesAndFiles(
+          finishedEnvelopeIds,
+          database,
+          undefined,
+          {
+            afterDeleteRows: async (tx) => {
+              deletedWebhookDeliveries = await deleteSignerWebhookDeliveries(
+                email,
+                finishedEnvelopeIds,
+                tx,
+                { inTransaction: true },
+              );
+            },
+          },
+        )
+      : 0;
+
+  if (finishedEnvelopeIds.length === 0) {
+    deletedWebhookDeliveries = await deleteSignerWebhookDeliveries(
+      email,
+      [],
+      database,
+    );
+  }
 
   return {
     deletedEnvelopes,
