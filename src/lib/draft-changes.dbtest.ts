@@ -485,3 +485,164 @@ test("a field save made on an older page does not overwrite a newer one", async 
   assert.equal(unchecked.fieldsRevision, seenRevision! + 2);
   assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
 });
+
+test("a field save overlapping with signer removal is refused cleanly instead of hitting the foreign key (issue #224)", async () => {
+  const draft = await createDraft();
+  const opened = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+  const seenRevision = opened?.fieldsRevision;
+
+  assert.equal(typeof seenRevision, "number");
+
+  // Place fields starts saving with both signers; before it takes the draft
+  // lock, Add signers removes Casey.
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        expectedRevision: seenRevision,
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, new RegExp(FIELDS_CHANGED_MESSAGE.slice(0, 30))),
+  );
+
+  // Casey and Casey's field are gone, Riley's field is untouched, and
+  // fields_revision moved on.
+  assert.deepEqual(
+    (await signersOf(draft.envelopeId)).map((signer) => signer.email),
+    [draft.rileyEmail],
+  );
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+
+  const reloaded = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+
+  assert.equal(reloaded?.fieldsRevision, seenRevision! + 1);
+});
+
+test("an unchecked field save overlapping with signer removal is refused as 400 inside the lock (issue #224)", async () => {
+  const draft = await createDraft();
+
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(400, /existing signer/),
+  );
+
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+});
+
+test("a field save overlapping with changing a signer to an approver is refused cleanly (issue #224)", async () => {
+  const draft = await createDraft();
+  const opened = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+  const seenRevision = opened?.fieldsRevision;
+
+  assert.equal(typeof seenRevision, "number");
+
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        expectedRevision: seenRevision,
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                  role: "signer",
+                },
+                {
+                  email: draft.caseyEmail,
+                  id: draft.casey,
+                  name: "Casey Second",
+                  role: "approver",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, new RegExp(FIELDS_CHANGED_MESSAGE.slice(0, 30))),
+  );
+
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+});
