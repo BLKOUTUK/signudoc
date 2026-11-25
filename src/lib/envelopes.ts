@@ -225,6 +225,8 @@ export const draftRecipientsChangedMessage =
 
 type VoidEnvelopeOptions = {
   database?: DbPool;
+  emailService?: EmailService;
+  storageService?: StorageService;
 };
 
 type EnvelopeRow = {
@@ -517,9 +519,10 @@ export class EnvelopeMutationError extends Error {
 }
 
 /**
- * The email service for a send. With no provider connected, sending is
- * refused with a message that says so, before anything changes, instead of
- * failing as an unexpected server error (issue #53).
+ * The email service for an action that emails signers (sending or voiding).
+ * With no provider connected, the action is refused with a message that says
+ * so, before anything changes, instead of failing as an unexpected server
+ * error (issues #53, #225).
  */
 function createEmailServiceForSending(): EmailService {
   try {
@@ -3986,7 +3989,11 @@ async function voidSentEnvelopeOnce(
   userId: string,
   envelopeId: string,
   input: VoidEnvelopeInput,
-  { database = getDb() }: VoidEnvelopeOptions = {},
+  {
+    database = getDb(),
+    emailService: givenEmailService,
+    storageService: givenStorageService,
+  }: VoidEnvelopeOptions = {},
 ): Promise<VoidEnvelopeResult> {
   const envelope = await getEnvelopeByIdForUser(userId, envelopeId, database);
 
@@ -4019,8 +4026,11 @@ async function voidSentEnvelopeOnce(
     (signer) => signer.status === "notified" || signer.status === "signed",
   );
   const voidedAt = Math.floor(Date.now() / 1000);
-  const emailService = createEmailService();
-  const storageService = createStorageService();
+  const emailService =
+    invitedSigners.length > 0
+      ? (givenEmailService ?? createEmailServiceForSending())
+      : null;
+  const storageService = givenStorageService ?? createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
 
   if (!sourcePdfHead.exists) {
@@ -4258,47 +4268,49 @@ async function voidSentEnvelopeOnce(
     throw error;
   });
 
-  const branding = await getBranding().catch(() => null);
+  if (emailService && invitedSigners.length > 0) {
+    const branding = await getBranding().catch(() => null);
 
-  await Promise.all(
-    invitedSigners.map(async (signer) => {
-      try {
-        if (!branding) {
-          throw new Error(
-            "Could not load settings for the notification email.",
+    await Promise.all(
+      invitedSigners.map(async (signer) => {
+        try {
+          if (!branding) {
+            throw new Error(
+              "Could not load settings for the notification email.",
+            );
+          }
+
+          const delivery = await emailService.send(
+            buildVoidNotificationEmail({
+              branding,
+              envelopeId,
+              envelopeTitle: envelope.title,
+              senderName: input.senderName,
+              signerEmail: signer.email,
+              signerName: signer.name,
+              signerSigned: signer.status === "signed",
+            }),
+          );
+
+          await recordEmailSent(
+            {
+              envelopeId,
+              messageId: delivery.messageId,
+              recipient: signer.email,
+              signerId: signer.id,
+              template: "void_notification",
+            },
+            database,
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send void notification for envelope ${envelopeId} to ${signer.email}:`,
+            error,
           );
         }
-
-        const delivery = await emailService.send(
-          buildVoidNotificationEmail({
-            branding,
-            envelopeId,
-            envelopeTitle: envelope.title,
-            senderName: input.senderName,
-            signerEmail: signer.email,
-            signerName: signer.name,
-            signerSigned: signer.status === "signed",
-          }),
-        );
-
-        await recordEmailSent(
-          {
-            envelopeId,
-            messageId: delivery.messageId,
-            recipient: signer.email,
-            signerId: signer.id,
-            template: "void_notification",
-          },
-          database,
-        );
-      } catch (error) {
-        console.error(
-          `Failed to send void notification for envelope ${envelopeId} to ${signer.email}:`,
-          error,
-        );
-      }
-    }),
-  );
+      }),
+    );
+  }
 
   return voidEnvelopeResponseSchema.parse({
     envelopeId,
